@@ -25,11 +25,16 @@ logging.basicConfig(
 )
 
 class KeycloakMigrationTool:
-    def __init__(self, path: str, realm: str):
+    def __init__(self, path: str, realm: str, groups_to_tenants: str = "false"):
         self.path = path
         self.realm = realm
+        self.groups_to_tenants = groups_to_tenants
         self.project_id = os.getenv('DESCOPE_PROJECT_ID')
         self.management_key = os.getenv('DESCOPE_MANAGEMENT_KEY')
+        if self.project_id.startswith('Peuc1'):
+            self.host = "api.euc1.descope.com"
+        else:
+            self.host = "api.descope.com"
        
         if not self.project_id or not self.management_key:
             raise ValueError("Environment variables DESCOPE_PROJECT_ID and DESCOPE_MANAGEMENT_KEY must be set.")
@@ -130,6 +135,95 @@ class KeycloakMigrationTool:
         except Exception as e:
             logging.error(f"Failed to get Keycloak groups: {str(e)}")
             return []
+        
+    def get_descope_custom_attributes(self) -> List[str]:
+        """Get existing custom user attributes from Descope"""
+        try:
+            url = f"https://{self.host}/v1/mgmt/user/customattributes"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.project_id}:{self.management_key}"
+            }
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            logging.info(f"Descope custom attributes: {data}")
+            # Return a list of attribute names
+            return [attr["name"] for attr in data.get("data", [])]
+        except Exception as e:
+            logging.error(f"Failed to get Descope custom attributes: {str(e)}")
+            return []
+
+    def get_keycloak_custom_attributes(self) -> List[dict]:
+        """Get custom user attributes from Keycloak realm file (excluding username and email)"""
+        try:
+            file_pattern = f"{self.realm}-realm"
+            for file_name in os.listdir(self.path):
+                if file_name.startswith(file_pattern) and file_name.endswith('.json'):
+                    with open(os.path.join(self.path, file_name), 'r') as f:
+                        file_data = json.load(f)
+                        components = file_data.get("components", {})
+                        user_profile_providers = components.get("org.keycloak.userprofile.UserProfileProvider", [])
+                        for provider in user_profile_providers:
+                            config = provider.get("config", {})
+                            kc_config_list = config.get("kc.user.profile.config", [])
+                            if not kc_config_list:
+                                continue
+                            kc_config_json = kc_config_list[0]
+                            kc_config = json.loads(kc_config_json)
+                            attributes = kc_config.get("attributes", [])
+                            # Exclude username and email
+                            return [
+                                attr for attr in attributes
+                                if attr.get("name") not in ("username", "email", "firstName", "lastName")
+                            ]
+            return []
+        except Exception as e:
+            logging.error(f"Failed to get Keycloak custom attributes: {str(e)}")
+            return []
+
+    def create_custom_attributes_in_descope(self) -> None:
+        """Create custom attributes in Descope that exist in Keycloak but not in Descope, in a single API call"""
+        print("Creating custom attributes in Descope...")
+        keycloak_attrs = self.get_keycloak_custom_attributes()
+        descope_attrs = self.get_descope_custom_attributes()
+        unique_attrs = [attr for attr in keycloak_attrs if attr.get("name") not in descope_attrs]
+        logging.info(f"Descope attributes: {descope_attrs} Keycloak attributes: {keycloak_attrs}, Unique attributes to create: {unique_attrs}")
+        if not unique_attrs:
+            print("No new custom attributes to create in Descope.")
+            return
+
+        payload = {
+            "attributes": [
+                {
+                    "name": attr.get("name"),
+                    "displayName": attr.get("displayName", attr.get("name")),
+                    "type": 5 if attr.get("multivalued") else 1
+                }
+                for attr in unique_attrs
+            ]
+        }
+
+        logging.info(f"Payload for creating custom attributes: {json.dumps(payload, indent=2)}")
+        url = f"https://{self.host}/v1/mgmt/user/customattribute/create"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.project_id}:{self.management_key}"
+        }
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            if response.status_code == 200:
+                logging.info(f"Created {len(unique_attrs)} custom attributes in Descope")
+                print(f"Created {len(unique_attrs)} custom attributes in Descope")
+            elif response.status_code == 409:
+                logging.info("Some or all custom attributes already exist in Descope")
+                print("Some or all custom attributes already exist in Descope")
+            else:
+                logging.error(f"Failed to create custom attributes: {response.status_code} - {response.text}")
+                print(f"Failed to create custom attributes: {response.status_code} - {response.text}")
+        except Exception as e:
+            logging.error(f"Exception creating custom attributes: {str(e)}")
+            print(f"Exception creating custom attributes: {str(e)}")
 
     def process_users(self) -> None:
         """Process all user export files in the specified directory that match the realm"""
@@ -170,7 +264,16 @@ class KeycloakMigrationTool:
                 email = user_data.get("email")
                 username = user_data.get("username")
                 verified_email = user_data.get("emailVerified", False)
+                given_name = user_data.get("firstName", "")
+                family_name = user_data.get("lastName", "")
                 
+                attributes = user_data.get("attributes", {})
+
+                custom_attributes = {
+                    key: value[0] if isinstance(value, list) and len(value) == 1 else value
+                    for key, value in attributes.items()
+                }
+
                 # Determine loginId and additionalIdentifiers
                 login_id = username if username else email
 
@@ -195,8 +298,13 @@ class KeycloakMigrationTool:
                     "additionalIdentifiers": additional_identifiers,
                     "hashedPassword": hashed_password,
                     "roleNames": user_roles,
-                    "userTenants": user_tenants
+                    "givenName": given_name,
+                    "familyName": family_name,
+                    "displayName": f"{given_name} {family_name}".strip(),
+                    "customAttributes": custom_attributes
                 }
+                if self.groups_to_tenants == "true":
+                    user["userTenants"] = user_tenants
 
                 user_batch.append(user)
 
@@ -208,8 +316,7 @@ class KeycloakMigrationTool:
                 "sendSMS": False,
             }
 
-            # API request
-            url = "https://api.descope.com/v1/mgmt/user/create/batch"
+            url = f"https://{self.host}/v1/mgmt/user/create/batch"
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.project_id}:{self.management_key}"
@@ -239,26 +346,48 @@ class KeycloakMigrationTool:
             if credential.get("type") == "password":
                 secret_data = json.loads(credential.get("secretData", "{}"))
                 cred_data = json.loads(credential.get("credentialData", "{}"))
-                return {
-                    "argon2": {
-                        "hash": secret_data.get("value", ""),
-                        "salt": secret_data.get("salt", ""),
-                        "iterations": cred_data.get("hashIterations", 3),
-                        "memory": int(cred_data.get("additionalParameters", {}).get("memory", ["7168"])[0]),
-                        "threads": int(cred_data.get("additionalParameters", {}).get("parallelism", ["1"])[0])
+                alg = cred_data.get("algorithm")
+                if alg.startswith("pbkdf2"):
+                    parts = alg.split("-")
+                    if len(parts) > 1:
+                        alg_type = parts[1]
+                    else:
+                        alg_type = "sha1"
+                    return {
+                        "pbkdf2": {
+                            "hash": secret_data.get("value", ""),
+                            "salt": secret_data.get("salt", ""),
+                            "iterations": cred_data.get("hashIterations"),
+                            "type": alg_type
+                        }
                     }
-                }
+                elif alg == "argon2":
+                    return {
+                        "argon2": {
+                            "hash": secret_data.get("value", ""),
+                            "salt": secret_data.get("salt", ""),
+                            "iterations": cred_data.get("hashIterations", 3),
+                            "memory": int(cred_data.get("additionalParameters", {}).get("memory", ["7168"])[0]),
+                            "threads": int(cred_data.get("additionalParameters", {}).get("parallelism", ["1"])[0])
+                        }
+                    }
+                else:
+                    logging.warning(f"Unsupported password algorithm: {alg}")
         return None
 
 def main():
     parser = argparse.ArgumentParser(description='Create users in Descope from Keycloak export files')
     parser.add_argument('--path', required=True, help='Path to the exported users folder')
     parser.add_argument('--realm', required=True, help='Name of the Keycloak realm')
+    parser.add_argument('--groups_to_tenants', required=True, help='Determines if groups should be created as tenants in Descope (true/false)')
     args = parser.parse_args()
 
-    migration_tool = KeycloakMigrationTool(args.path, args.realm)
+    migration_tool = KeycloakMigrationTool(args.path, args.realm, args.groups_to_tenants)
     migration_tool.create_roles_in_descope()
-    migration_tool.create_groups_in_descope()
+    if args.groups_to_tenants == "true":
+        migration_tool.create_groups_in_descope()
+    
+    migration_tool.create_custom_attributes_in_descope()
     migration_tool.process_users()
 
 if __name__ == "__main__":
