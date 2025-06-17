@@ -77,7 +77,7 @@ keycloak-export/
 
 From the root of the project, run:
 ```bash
-python src/main.py --realm myrealm --path /absolute/path/to/keycloak-export --map_groups_to tenants\\roles\\none --federated_apps app_id1,app_id2
+python src/main.py --realm myrealm --path /absolute/path/to/keycloak-export --map_groups_to tenants\roles\none --federated_apps app_id1,app_id2
 ```
 
 - `--realm` is the name of the realm you exported (not `master`)
