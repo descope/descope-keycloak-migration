@@ -77,13 +77,13 @@ keycloak-export/
 
 From the root of the project, run:
 ```bash
-python src/main.py --realm myrealm --path /absolute/path/to/keycloak-export --groups_to_tenants true
+python src/main.py --realm myrealm --path /absolute/path/to/keycloak-export --groups_to_tenants true --federated_apps app_id1,app_id2
 ```
 
 - `--realm` is the name of the realm you exported (not `master`)
 - `--path` is the absolute path to the exported JSON files
 - `--groups_to_tenants` determines if groups should be created as tenants in Descope (true/false)
-
+- `--federated_apps` comma-separated list of federated applications (app ID) to which the created users will be assigned
 
 > A `logs/` folder will be created with details about the process.
 

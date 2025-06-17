@@ -25,10 +25,10 @@ logging.basicConfig(
 )
 
 class KeycloakMigrationTool:
-    def __init__(self, path: str, realm: str, groups_to_tenants: str = "false"):
+    def __init__(self, path: str, realm: str, map_groups_to: str, federated_apps: str = None):
         self.path = path
         self.realm = realm
-        self.groups_to_tenants = groups_to_tenants
+        self.map_groups_to = map_groups_to
         self.project_id = os.getenv('DESCOPE_PROJECT_ID')
         self.management_key = os.getenv('DESCOPE_MANAGEMENT_KEY')
         if self.project_id.startswith('Peuc1'):
@@ -38,6 +38,11 @@ class KeycloakMigrationTool:
        
         if not self.project_id or not self.management_key:
             raise ValueError("Environment variables DESCOPE_PROJECT_ID and DESCOPE_MANAGEMENT_KEY must be set.")
+
+        if federated_apps is not None:
+            self.federated_apps = [app.strip() for app in federated_apps.split(',')]
+        else:
+            self.federated_apps = []
 
         self.descope_client = DescopeClient(project_id=self.project_id, management_key=self.management_key)
     
@@ -95,7 +100,13 @@ class KeycloakMigrationTool:
         print("Creating groups in Descope...")
         try:
             keycloak_groups = self.get_keycloak_groups()
-            descope_groups = self.get_descope_groups()
+            if self.map_groups_to == "tenants":
+                descope_groups = self.get_descope_tenants()
+            elif self.map_groups_to == "roles":
+                descope_groups = self.get_descope_roles()
+            else:
+                logging.info("Not creating groups as map_groups_to is set to 'none'")
+                return
             
             # Create groups that exist in Keycloak but not in Descope
             unique_groups = set(keycloak_groups) - set(descope_groups)
@@ -103,7 +114,11 @@ class KeycloakMigrationTool:
             
             for group_name in unique_groups:
                 try:
-                    self.descope_client.mgmt.tenant.create(name=group_name, id=group_name)
+                    if self.map_groups_to == "tenants":
+                        self.descope_client.mgmt.tenant.create(name=group_name, id=group_name)
+                    elif self.map_groups_to == "roles":
+                        self.descope_client.mgmt.role.create(name=group_name)
+
                     logging.info(f"Created group in Descope: {group_name}")
                     num_groups += 1
                 except Exception as e:
@@ -113,7 +128,7 @@ class KeycloakMigrationTool:
         except Exception as e:
             logging.error(f"Failed to create groups: {str(e)}")
 
-    def get_descope_groups(self) -> List[str]:
+    def get_descope_tenants(self) -> List[str]:
         """Get existing tenants from Descope"""
         try:
             tenants_resp = self.descope_client.mgmt.tenant.load_all()
@@ -147,7 +162,6 @@ class KeycloakMigrationTool:
             response = requests.get(url, headers=headers)
             response.raise_for_status()
             data = response.json()
-            logging.info(f"Descope custom attributes: {data}")
             # Return a list of attribute names
             return [attr["name"] for attr in data.get("data", [])]
         except Exception as e:
@@ -155,13 +169,18 @@ class KeycloakMigrationTool:
             return []
 
     def get_keycloak_custom_attributes(self) -> List[dict]:
-        """Get custom user attributes from Keycloak realm file (excluding username and email)"""
+        """Get custom user attributes from Keycloak realm file (excluding username, email, firstName, lastName).
+        Also includes attributes from clients' protocolMappers with config.user.attribute.
+        """
         try:
             file_pattern = f"{self.realm}-realm"
             for file_name in os.listdir(self.path):
                 if file_name.startswith(file_pattern) and file_name.endswith('.json'):
                     with open(os.path.join(self.path, file_name), 'r') as f:
                         file_data = json.load(f)
+                        attributes = []
+
+                        # 1. From user profile config
                         components = file_data.get("components", {})
                         user_profile_providers = components.get("org.keycloak.userprofile.UserProfileProvider", [])
                         for provider in user_profile_providers:
@@ -171,12 +190,28 @@ class KeycloakMigrationTool:
                                 continue
                             kc_config_json = kc_config_list[0]
                             kc_config = json.loads(kc_config_json)
-                            attributes = kc_config.get("attributes", [])
-                            # Exclude username and email
-                            return [
-                                attr for attr in attributes
+                            profile_attrs = kc_config.get("attributes", [])
+                            # Exclude username, email, firstName, lastName
+                            attributes.extend([
+                                attr for attr in profile_attrs
                                 if attr.get("name") not in ("username", "email", "firstName", "lastName")
-                            ]
+                            ])
+
+                        # 2. From clients' protocolMappers with config.user.attribute
+                        clients = file_data.get("clients", [])
+                        seen_names = set(attr.get("name") for attr in attributes)
+                        for client in clients:
+                            for mapper in client.get("protocolMappers", []):
+                                config = mapper.get("config", {})
+                                user_attr = config.get("user.attribute")
+                                if user_attr and user_attr not in ("username", "email", "firstName", "lastName") and user_attr not in seen_names:
+                                    attributes.append({
+                                        "name": mapper.get("user.attribute", user_attr),
+                                        "displayName": mapper.get("user.attribute", user_attr),
+                                        "multivalued": config.get("multivalued", "false") == "true"
+                                    })
+                                    seen_names.add(user_attr)
+                        return attributes
             return []
         except Exception as e:
             logging.error(f"Failed to get Keycloak custom attributes: {str(e)}")
@@ -188,7 +223,7 @@ class KeycloakMigrationTool:
         keycloak_attrs = self.get_keycloak_custom_attributes()
         descope_attrs = self.get_descope_custom_attributes()
         unique_attrs = [attr for attr in keycloak_attrs if attr.get("name") not in descope_attrs]
-        logging.info(f"Descope attributes: {descope_attrs} Keycloak attributes: {keycloak_attrs}, Unique attributes to create: {unique_attrs}")
+        logging.info(f"Unique attributes to create: {unique_attrs}")
         if not unique_attrs:
             print("No new custom attributes to create in Descope.")
             return
@@ -204,7 +239,6 @@ class KeycloakMigrationTool:
             ]
         }
 
-        logging.info(f"Payload for creating custom attributes: {json.dumps(payload, indent=2)}")
         url = f"https://{self.host}/v1/mgmt/user/customattribute/create"
         headers = {
             "Content-Type": "application/json",
@@ -280,8 +314,12 @@ class KeycloakMigrationTool:
                 user_roles = user_data.get("realmRoles", [])
                 for clientRoles in user_data.get("clientRoles",{}).values():
                     user_roles.extend(clientRoles)
-
-                user_tenants = [ {"tenantId": group.lstrip("/")} for group in user_data.get("groups", [])]
+                
+                user_tenants = []
+                if self.map_groups_to == "roles":
+                    user_roles.extend([group.lstrip("/") for group in user_data.get("groups", [])])
+                elif self.map_groups_to == "tenants":
+                    user_tenants = [ {"tenantId": group.lstrip("/")} for group in user_data.get("groups", [])]
                 
                 additional_identifiers = [email] if username else []
                 if user_data.get("enabled") == False:
@@ -303,8 +341,12 @@ class KeycloakMigrationTool:
                     "displayName": f"{given_name} {family_name}".strip(),
                     "customAttributes": custom_attributes
                 }
-                if self.groups_to_tenants == "true":
+
+                if len(user_tenants) > 0:
                     user["userTenants"] = user_tenants
+
+                if len(self.federated_apps) > 0:
+                    user["ssoAppIds"] = self.federated_apps
 
                 user_batch.append(user)
 
@@ -379,12 +421,13 @@ def main():
     parser = argparse.ArgumentParser(description='Create users in Descope from Keycloak export files')
     parser.add_argument('--path', required=True, help='Path to the exported users folder')
     parser.add_argument('--realm', required=True, help='Name of the Keycloak realm')
-    parser.add_argument('--groups_to_tenants', required=True, help='Determines if groups should be created as tenants in Descope (true/false)')
+    parser.add_argument('--map_groups_to', required=True, help='Determines if groups should be created as tenants or as roles in Descope (tenants/roles/none)')
+    parser.add_argument('--federated_apps', required=False, help='If set, users will have access to the requested federated apps (app IDs separated by commas)', default=None)
     args = parser.parse_args()
 
-    migration_tool = KeycloakMigrationTool(args.path, args.realm, args.groups_to_tenants)
+    migration_tool = KeycloakMigrationTool(args.path, args.realm, args.map_groups_to, args.federated_apps)
     migration_tool.create_roles_in_descope()
-    if args.groups_to_tenants == "true":
+    if args.map_groups_to in ["tenants", "roles"]:
         migration_tool.create_groups_in_descope()
     
     migration_tool.create_custom_attributes_in_descope()
