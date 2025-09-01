@@ -413,6 +413,12 @@ class KeycloakMigrationTool:
                             "threads": int(cred_data.get("additionalParameters", {}).get("parallelism", ["1"])[0])
                         }
                     }
+                elif alg == "MD5":
+                    return {
+                        "md5": {
+                            "hash": secret_data.get("value", "")
+                        }
+                    }
                 else:
                     logging.warning(f"Unsupported password algorithm: {alg}")
         return None
