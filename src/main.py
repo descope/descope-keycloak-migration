@@ -412,7 +412,7 @@ class KeycloakMigrationTool:
                             "memory": int(cred_data.get("additionalParameters", {}).get("memory", ["7168"])[0]),
                             "threads": int(cred_data.get("additionalParameters", {}).get("parallelism", ["1"])[0])
                         }
-                    },
+                    }
                 elif alg == "MD5":
                     return {
                         "md5": {
